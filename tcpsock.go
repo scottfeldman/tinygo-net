@@ -1,5 +1,3 @@
-// TINYGO: The following is copied and modified from Go 1.21.4 official implementation.
-
 // Copyright 2009 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
@@ -7,15 +5,17 @@
 package net
 
 import (
-	"errors"
-	"fmt"
+	"context"
 	"internal/itoa"
 	"io"
 	"net/netip"
-	"strconv"
+	"os"
 	"syscall"
 	"time"
 )
+
+// BUG(mikio): On JS and Windows, the File method of TCPConn and
+// TCPListener is not implemented.
 
 // TCPAddr represents the address of a TCP end point.
 type TCPAddr struct {
@@ -24,7 +24,7 @@ type TCPAddr struct {
 	Zone string // IPv6 scoped addressing zone
 }
 
-// AddrPort returns the TCPAddr a as a netip.AddrPort.
+// AddrPort returns the [TCPAddr] a as a [netip.AddrPort].
 //
 // If a.Port does not fit in a uint16, it's silently truncated.
 //
@@ -79,47 +79,24 @@ func (a *TCPAddr) opAddr() Addr {
 // recommended, because it will return at most one of the host name's
 // IP addresses.
 //
-// See func Dial for a description of the network and address
+// See func [Dial] for a description of the network and address
 // parameters.
 func ResolveTCPAddr(network, address string) (*TCPAddr, error) {
-
 	switch network {
-	case "tcp", "tcp4":
+	case "tcp", "tcp4", "tcp6":
+	case "": // a hint wildcard for Go 1.0 undocumented behavior
+		network = "tcp"
 	default:
-		return nil, fmt.Errorf("Network '%s' not supported", network)
+		return nil, UnknownNetworkError(network)
 	}
-
-	switch address {
-	case ":http":
-		address = ":80"
-	}
-
-	// TINYGO: Use netdev resolver
-
-	host, sport, err := SplitHostPort(address)
+	addrs, err := DefaultResolver.internetAddrList(context.Background(), network, address)
 	if err != nil {
 		return nil, err
 	}
-
-	port, err := strconv.Atoi(sport)
-	if err != nil {
-		return nil, fmt.Errorf("Error parsing port '%s' in address: %s",
-			sport, err)
-	}
-
-	if host == "" {
-		return &TCPAddr{Port: port}, nil
-	}
-
-	ip, err := netdev.GetHostByName(host)
-	if err != nil {
-		return nil, fmt.Errorf("Lookup of host name '%s' failed: %s", host, err)
-	}
-
-	return &TCPAddr{IP: ip.AsSlice(), Port: port}, nil
+	return addrs.forResolve(network, address).(*TCPAddr), nil
 }
 
-// TCPAddrFromAddrPort returns addr as a TCPAddr. If addr.IsValid() is false,
+// TCPAddrFromAddrPort returns addr as a [TCPAddr]. If addr.IsValid() is false,
 // then the returned TCPAddr will contain a nil IP field, indicating an
 // address family-agnostic unspecified address.
 func TCPAddrFromAddrPort(addr netip.AddrPort) *TCPAddr {
@@ -130,111 +107,66 @@ func TCPAddrFromAddrPort(addr netip.AddrPort) *TCPAddr {
 	}
 }
 
-// TCPConn is an implementation of the Conn interface for TCP network
+// TCPConn is an implementation of the [Conn] interface for TCP network
 // connections.
 type TCPConn struct {
-	fd            int
-	net           string
-	laddr         *TCPAddr
-	raddr         *TCPAddr
-	readDeadline  time.Time
-	writeDeadline time.Time
+	conn
 }
-
-// DialTCP acts like Dial for TCP networks.
-//
-// The network must be a TCP network name; see func Dial for details.
-//
-// If laddr is nil, a local address is automatically chosen.
-// If the IP field of raddr is nil or an unspecified IP address, the
-// local system is assumed.
-func DialTCP(network string, laddr, raddr *TCPAddr) (*TCPConn, error) {
-
-	switch network {
-	case "tcp", "tcp4":
-	default:
-		return nil, errors.New("Network not supported: '" + network + "'")
-	}
-
-	// TINYGO: Use netdev to create TCP socket and connect
-
-	if raddr == nil {
-		raddr = &TCPAddr{}
-	}
-
-	if raddr.IP.IsUnspecified() {
-		return nil, errors.New("Sorry, localhost isn't available on Tinygo")
-	} else if len(raddr.IP) != 4 {
-		return nil, errors.New("only ipv4 supported")
-	}
-
-	fd, err := netdev.Socket(_AF_INET, _SOCK_STREAM, _IPPROTO_TCP)
-	if err != nil {
-		return nil, err
-	}
-
-	rip, _ := netip.AddrFromSlice(raddr.IP)
-	raddrport := netip.AddrPortFrom(rip, uint16(raddr.Port))
-	if err = netdev.Connect(fd, "", raddrport); err != nil {
-		netdev.Close(fd)
-		return nil, err
-	}
-
-	return &TCPConn{
-		fd:    fd,
-		net:   network,
-		laddr: laddr,
-		raddr: raddr,
-	}, nil
-}
-
-// TINYGO: Use netdev for Conn methods: Read = Recv, Write = Send, etc.
 
 // SyscallConn returns a raw network connection.
-// This implements the syscall.Conn interface.
+// This implements the [syscall.Conn] interface.
 func (c *TCPConn) SyscallConn() (syscall.RawConn, error) {
-	return nil, errors.New("SyscallConn not implemented")
+	if !c.ok() {
+		return nil, syscall.EINVAL
+	}
+	return newRawConn(c.fd), nil
 }
 
-func (c *TCPConn) Read(b []byte) (int, error) {
-	n, err := netdev.Recv(c.fd, b, 0, c.readDeadline)
-	// Turn the -1 socket error into 0 and let err speak for error
-	if n < 0 {
-		n = 0
+// ReadFrom implements the [io.ReaderFrom] ReadFrom method.
+func (c *TCPConn) ReadFrom(r io.Reader) (int64, error) {
+	if !c.ok() {
+		return 0, syscall.EINVAL
 	}
+	n, err := c.readFrom(r)
 	if err != nil && err != io.EOF {
-		err = &OpError{Op: "read", Net: c.net, Source: c.laddr, Addr: c.raddr, Err: err}
+		err = &OpError{Op: "readfrom", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}
 	}
 	return n, err
 }
 
-func (c *TCPConn) Write(b []byte) (int, error) {
-	n, err := netdev.Send(c.fd, b, 0, c.writeDeadline)
-	// Turn the -1 socket error into 0 and let err speak for error
-	if n < 0 {
-		n = 0
+// WriteTo implements the io.WriterTo WriteTo method.
+func (c *TCPConn) WriteTo(w io.Writer) (int64, error) {
+	if !c.ok() {
+		return 0, syscall.EINVAL
 	}
-	if err != nil {
-		err = &OpError{Op: "write", Net: c.net, Source: c.laddr, Addr: c.raddr, Err: err}
+	n, err := c.writeTo(w)
+	if err != nil && err != io.EOF {
+		err = &OpError{Op: "writeto", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}
 	}
 	return n, err
 }
 
-func (c *TCPConn) Close() error {
-	return netdev.Close(c.fd)
+// CloseRead shuts down the reading side of the TCP connection.
+// Most callers should just use Close.
+func (c *TCPConn) CloseRead() error {
+	if !c.ok() {
+		return syscall.EINVAL
+	}
+	if err := c.fd.closeRead(); err != nil {
+		return &OpError{Op: "close", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}
+	}
+	return nil
 }
 
-func (c *TCPConn) LocalAddr() Addr {
-	return c.laddr
-}
-
-func (c *TCPConn) RemoteAddr() Addr {
-	return c.raddr
-}
-
-func (c *TCPConn) SetDeadline(t time.Time) error {
-	c.readDeadline = t
-	c.writeDeadline = t
+// CloseWrite shuts down the writing side of the TCP connection.
+// Most callers should just use Close.
+func (c *TCPConn) CloseWrite() error {
+	if !c.ok() {
+		return syscall.EINVAL
+	}
+	if err := c.fd.closeWrite(); err != nil {
+		return &OpError{Op: "close", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}
+	}
 	return nil
 }
 
@@ -253,84 +185,223 @@ func (c *TCPConn) SetDeadline(t time.Time) error {
 // On some operating systems after sec seconds have elapsed any remaining
 // unsent data may be discarded.
 func (c *TCPConn) SetLinger(sec int) error {
-	return netdev.SetSockOpt(c.fd, _SOL_SOCKET, _SO_LINGER, sec)
+	if !c.ok() {
+		return syscall.EINVAL
+	}
+	if err := setLinger(c.fd, sec); err != nil {
+		return &OpError{Op: "set", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}
+	}
+	return nil
 }
 
 // SetKeepAlive sets whether the operating system should send
 // keep-alive messages on the connection.
 func (c *TCPConn) SetKeepAlive(keepalive bool) error {
-	return netdev.SetSockOpt(c.fd, _SOL_SOCKET, _SO_KEEPALIVE, keepalive)
+	if !c.ok() {
+		return syscall.EINVAL
+	}
+	if err := setKeepAlive(c.fd, keepalive); err != nil {
+		return &OpError{Op: "set", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}
+	}
+	return nil
 }
 
 // SetKeepAlivePeriod sets period between keep-alives.
 func (c *TCPConn) SetKeepAlivePeriod(d time.Duration) error {
-	// Units are 1/2 seconds
-	return netdev.SetSockOpt(c.fd, _SOL_TCP, _TCP_KEEPINTVL, 2*d.Seconds())
-}
-
-func (c *TCPConn) SetReadDeadline(t time.Time) error {
-	c.readDeadline = t
+	if !c.ok() {
+		return syscall.EINVAL
+	}
+	if err := setKeepAlivePeriod(c.fd, d); err != nil {
+		return &OpError{Op: "set", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}
+	}
 	return nil
 }
 
-func (c *TCPConn) SetWriteDeadline(t time.Time) error {
-	c.writeDeadline = t
+// SetNoDelay controls whether the operating system should delay
+// packet transmission in hopes of sending fewer packets (Nagle's
+// algorithm).  The default is true (no delay), meaning that data is
+// sent as soon as possible after a Write.
+func (c *TCPConn) SetNoDelay(noDelay bool) error {
+	if !c.ok() {
+		return syscall.EINVAL
+	}
+	if err := setNoDelay(c.fd, noDelay); err != nil {
+		return &OpError{Op: "set", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}
+	}
 	return nil
 }
 
-func (c *TCPConn) CloseWrite() error {
-	return fmt.Errorf("CloseWrite not implemented")
-}
-
-type listener struct {
-	fd    int
-	laddr *TCPAddr
-}
-
-func (l *listener) Accept() (Conn, error) {
-	fd, raddr, err := netdev.Accept(l.fd)
-	if err != nil {
-		return nil, err
+// MultipathTCP reports whether the ongoing connection is using MPTCP.
+//
+// If Multipath TCP is not supported by the host, by the other peer or
+// intentionally / accidentally filtered out by a device in between, a
+// fallback to TCP will be done. This method does its best to check if
+// MPTCP is still being used or not.
+//
+// On Linux, more conditions are verified on kernels >= v5.16, improving
+// the results.
+func (c *TCPConn) MultipathTCP() (bool, error) {
+	if !c.ok() {
+		return false, syscall.EINVAL
 	}
-
-	return &TCPConn{
-		fd:    fd,
-		net:   "tcp",
-		laddr: l.laddr,
-		raddr: TCPAddrFromAddrPort(raddr),
-	}, nil
+	return isUsingMultipathTCP(c.fd), nil
 }
 
-func (l *listener) Close() error {
-	return netdev.Close(l.fd)
+func newTCPConn(fd *netFD, keepAlive time.Duration, keepAliveHook func(time.Duration)) *TCPConn {
+	setNoDelay(fd, true)
+	if keepAlive == 0 {
+		keepAlive = defaultTCPKeepAlive
+	}
+	if keepAlive > 0 {
+		setKeepAlive(fd, true)
+		setKeepAlivePeriod(fd, keepAlive)
+		if keepAliveHook != nil {
+			keepAliveHook(keepAlive)
+		}
+	}
+	return &TCPConn{conn{fd}}
 }
 
-func (l *listener) Addr() Addr {
-	return l.laddr
-}
-
-func listenTCP(laddr *TCPAddr) (Listener, error) {
-	fd, err := netdev.Socket(_AF_INET, _SOCK_STREAM, _IPPROTO_TCP)
-	if err != nil {
-		return nil, err
+// DialTCP acts like [Dial] for TCP networks.
+//
+// The network must be a TCP network name; see func Dial for details.
+//
+// If laddr is nil, a local address is automatically chosen.
+// If the IP field of raddr is nil or an unspecified IP address, the
+// local system is assumed.
+func DialTCP(network string, laddr, raddr *TCPAddr) (*TCPConn, error) {
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+	default:
+		return nil, &OpError{Op: "dial", Net: network, Source: laddr.opAddr(), Addr: raddr.opAddr(), Err: UnknownNetworkError(network)}
 	}
-
-	laddrport := laddr.AddrPort()
-	err = netdev.Bind(fd, laddrport)
-	if err != nil {
-		return nil, err
+	if raddr == nil {
+		return nil, &OpError{Op: "dial", Net: network, Source: laddr.opAddr(), Addr: nil, Err: errMissingAddress}
 	}
-
-	err = netdev.Listen(fd, 5)
+	sd := &sysDialer{network: network, address: raddr.String()}
+	c, err := sd.dialTCP(context.Background(), laddr, raddr)
 	if err != nil {
-		return nil, err
+		return nil, &OpError{Op: "dial", Net: network, Source: laddr.opAddr(), Addr: raddr.opAddr(), Err: err}
 	}
-
-	return &listener{fd: fd, laddr: laddr}, nil
+	return c, nil
 }
 
 // TCPListener is a TCP network listener. Clients should typically
-// use variables of type Listener instead of assuming TCP.
+// use variables of type [Listener] instead of assuming TCP.
 type TCPListener struct {
-	listener
+	fd *netFD
+	lc ListenConfig
+}
+
+// SyscallConn returns a raw network connection.
+// This implements the [syscall.Conn] interface.
+//
+// The returned RawConn only supports calling Control. Read and
+// Write return an error.
+func (l *TCPListener) SyscallConn() (syscall.RawConn, error) {
+	if !l.ok() {
+		return nil, syscall.EINVAL
+	}
+	return newRawListener(l.fd), nil
+}
+
+// AcceptTCP accepts the next incoming call and returns the new
+// connection.
+func (l *TCPListener) AcceptTCP() (*TCPConn, error) {
+	if !l.ok() {
+		return nil, syscall.EINVAL
+	}
+	c, err := l.accept()
+	if err != nil {
+		return nil, &OpError{Op: "accept", Net: l.fd.net, Source: nil, Addr: l.fd.laddr, Err: err}
+	}
+	return c, nil
+}
+
+// Accept implements the Accept method in the [Listener] interface; it
+// waits for the next call and returns a generic [Conn].
+func (l *TCPListener) Accept() (Conn, error) {
+	if !l.ok() {
+		return nil, syscall.EINVAL
+	}
+	c, err := l.accept()
+	if err != nil {
+		return nil, &OpError{Op: "accept", Net: l.fd.net, Source: nil, Addr: l.fd.laddr, Err: err}
+	}
+	return c, nil
+}
+
+// Close stops listening on the TCP address.
+// Already Accepted connections are not closed.
+func (l *TCPListener) Close() error {
+	if !l.ok() {
+		return syscall.EINVAL
+	}
+	if err := l.close(); err != nil {
+		return &OpError{Op: "close", Net: l.fd.net, Source: nil, Addr: l.fd.laddr, Err: err}
+	}
+	return nil
+}
+
+// Addr returns the listener's network address, a [*TCPAddr].
+// The Addr returned is shared by all invocations of Addr, so
+// do not modify it.
+func (l *TCPListener) Addr() Addr { return l.fd.laddr }
+
+// SetDeadline sets the deadline associated with the listener.
+// A zero time value disables the deadline.
+func (l *TCPListener) SetDeadline(t time.Time) error {
+	if !l.ok() {
+		return syscall.EINVAL
+	}
+	return l.fd.SetDeadline(t)
+}
+
+// File returns a copy of the underlying [os.File].
+// It is the caller's responsibility to close f when finished.
+// Closing l does not affect f, and closing f does not affect l.
+//
+// The returned os.File's file descriptor is different from the
+// connection's. Attempting to change properties of the original
+// using this duplicate may or may not have the desired effect.
+func (l *TCPListener) File() (f *os.File, err error) {
+	if !l.ok() {
+		return nil, syscall.EINVAL
+	}
+	f, err = l.file()
+	if err != nil {
+		return nil, &OpError{Op: "file", Net: l.fd.net, Source: nil, Addr: l.fd.laddr, Err: err}
+	}
+	return
+}
+
+// ListenTCP acts like [Listen] for TCP networks.
+//
+// The network must be a TCP network name; see func Dial for details.
+//
+// If the IP field of laddr is nil or an unspecified IP address,
+// ListenTCP listens on all available unicast and anycast IP addresses
+// of the local system.
+// If the Port field of laddr is 0, a port number is automatically
+// chosen.
+func ListenTCP(network string, laddr *TCPAddr) (*TCPListener, error) {
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+	default:
+		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: laddr.opAddr(), Err: UnknownNetworkError(network)}
+	}
+	if laddr == nil {
+		laddr = &TCPAddr{}
+	}
+	sl := &sysListener{network: network, address: laddr.String()}
+	ln, err := sl.listenTCP(context.Background(), laddr)
+	if err != nil {
+		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: laddr.opAddr(), Err: err}
+	}
+	return ln, nil
+}
+
+// roundDurationUp rounds d to the next multiple of to.
+func roundDurationUp(d time.Duration, to time.Duration) time.Duration {
+	return (d + to - 1) / to
 }
